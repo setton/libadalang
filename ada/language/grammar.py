@@ -1011,13 +1011,14 @@ A.add_rules(
     ),
 
     aggregate=Or(
+        NullRecordAggregate("(", Opt(A.expr, "with"),
+                            "null", "record", Null(AssocList), ")"),
         Aggregate(
-            "(", Opt(A.expr, "with"),
+            "(", cut(),
+            Opt(A.expr, "with"),
             List(A.aggregate_assoc, sep=",", list_cls=AssocList),
             ")"
         ),
-        NullRecordAggregate("(", Opt(A.expr, "with"),
-                            "null", "record", Null(AssocList), ")")
     ),
 
     direct_name=Or(A.identifier, A.string_literal, A.char_literal),
@@ -1067,14 +1068,13 @@ A.add_rules(
         DottedName(A.qual_name_internal, ".", A.direct_name),
         # Attributes, needed because of 'Class: A'Class'(...)
         AttributeRef(
-            A.qual_name_internal, "'", A.identifier,
-            Opt("(", A.call_suffix, ")")
+            A.qual_name_internal, "'", A.identifier, Null(AdaNode)
         ),
         A.direct_name
     ),
 
     name=Or(
-        CallExpr(A.name, "(", A.call_suffix, ")"),
+        CallExpr(A.name, "(", cut(), A.call_suffix, ")"),
         DottedName(A.name, ".", A.direct_name),
         ExplicitDeref(A.name, ".", "all"),
 
@@ -1099,7 +1099,7 @@ A.add_rules(
 
     update_attr_aggregate=Or(
         A.aggregate,
-        Aggregate("(", Null(Expr), A.update_attr_content, ")")
+        Aggregate("(", cut(), Null(Expr), A.update_attr_content, ")")
     ),
 
     update_attr_content=List(A.multidim_array_assoc, sep=",",

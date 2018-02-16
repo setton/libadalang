@@ -89,14 +89,10 @@ indent_map = {
     lal.BaseRecordDef: IndentRules(
         field_rules=indent_fields(components=block_rule)
     ),
-    lal.Params: IndentRules(
-        on_token_start="(",
-        on_token_end=")"
-    ),
-    lal.ParenExpr: IndentRules(
-        on_token_start="(",
-        on_token_end=")"
-    ),
+    lal.Params: IndentRules(on_token_start="(", on_token_end=")"),
+    lal.ParenExpr: IndentRules(on_token_start="(", on_token_end=")"),
+    lal.Aggregate: IndentRules(on_token_start="(", on_token_end=")"),
+    lal.CallExpr: IndentRules(on_token_start="(", on_token_end=")"),
     lal.Stmt: IndentRules(cont_line=2),
     lal.ObjectDecl: IndentRules(cont_line=2),
 }

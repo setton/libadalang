@@ -7039,9 +7039,9 @@ class BinOp(Expr):
                 ),
                 And(
                     TypeBind(Self.left.type_var, Self.type_var,
-                             conv_prop=BaseTypeDecl.canonical_type_or_null),
+                             conv_prop=BaseTypeDecl.base_subtype_or_null),
                     TypeBind(Self.right.type_var, Self.type_var,
-                             conv_prop=BaseTypeDecl.canonical_type_or_null)
+                             conv_prop=BaseTypeDecl.base_subtype_or_null)
                 ),
             ),
 

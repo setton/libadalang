@@ -251,7 +251,7 @@ package body Libadalang.Expr_Eval is
                --  expression.
                return Expr_Eval (D.As_Number_Decl.F_Expr);
 
-            when Ada_Object_Decl =>
+            when Ada_Object_Decl_Range =>
                if not D.As_Object_Decl.F_Renaming_Clause.Is_Null then
                   return Expr_Eval
                     (D.As_Object_Decl.F_Renaming_Clause
@@ -384,8 +384,7 @@ package body Libadalang.Expr_Eval is
 
       case E.Kind is
          when Ada_Identifier | Ada_Dotted_Name =>
-            return Eval_Decl
-              (E.As_Name.P_Referenced_Decl_Internal (Try_Immediate => True));
+            return Eval_Decl (E.As_Name.P_Referenced_Decl);
 
          when Ada_Char_Literal =>
             declare

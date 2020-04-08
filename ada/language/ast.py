@@ -500,32 +500,48 @@ class AdaNode(ASTNode):
                   Entity.stop_resolution_equation,
                   Entity.xref_equation)
 
+    @langkit_property(return_type=Bool, memoized=True, call_memoizable=True,
+                      dynamic_vars=[env, origin])
+    def resolve_own_names():
+        """
+        Resolve names for this node up to xref_entry_point and
+        xref_stop_resolution boundaries.
+        """
+        return Entity.xref_equation.solve
+
     @langkit_property(return_type=Bool, dynamic_vars=[env, origin])
-    def resolve_names_internal(initial=Bool, additional_equation=Equation):
+    def resolve_children_names():
         """
-        Internal helper for resolve_names, implementing the recursive logic.
+        Internal helper for resolve_names, implementing the recursive logic
+        needed to resolve names across xref_stop_resolution boundaries.
         """
-
-        solve_xref = Var(initial | Self.xref_stop_resolution)
-
-        i = Var(If(
-            solve_xref,
-            (Entity.xref_equation & additional_equation).solve,
-            True)
-        )
-
-        j = Var(Self.children.all(lambda c: c.then(
-            # Do not explore nodes that are xref entry points, and are not the
-            # initial node.
+        return Self.children.all(lambda c: c.then(
+            # Only resolve nodes that have xref_stop_resolution set, and do not
+            # recursively explore nodes that are xref entry points.
             lambda c: If(
                 c.xref_entry_point,
                 True,
-                c.as_entity.resolve_names_internal(False, LogicTrue()),
+                If(c.xref_stop_resolution, c.as_entity.resolve_own_names, True)
+                & c.as_entity.resolve_children_names,
             ),
             default_val=True
-        )))
+        ))
 
-        return i & j
+    @langkit_property(return_type=Bool, dynamic_vars=[env, origin])
+    def resolve_names_internal():
+        """
+        Resolves names for this node up to xref_entry_point boundaries.
+        """
+        return Entity.resolve_own_names & Entity.resolve_children_names
+
+    @langkit_property(return_type=Bool, dynamic_vars=[env, origin])
+    def resolve_names_internal_with_eq(additional_equation=Equation):
+        """
+        Resolves names in this node with an additional constraint given by
+        ``additional_equation``, up to xref_entry_point boundaries.
+        """
+        return ((Entity.xref_equation & additional_equation).solve
+                & Entity.resolve_children_names)
 
     xref_entry_point = Property(
         False,
@@ -552,13 +568,31 @@ class AdaNode(ASTNode):
         """
         return env.bind(
             Entity.children_env,
-            origin.bind(Self.origin_node,
-                        Entity.resolve_names_internal(True, LogicTrue()))
+            origin.bind(Self.origin_node, Entity.resolve_names_internal)
         )
 
-    resolve_names_from_closest_entry_point = Property(
-        Entity.parents.find(lambda p: p.xref_entry_point).resolve_names
-    )
+    @langkit_property(return_type=Bool)
+    def resolve_names_from_closest_entry_point():
+        """
+        Resolve names from the closest entry point up to this node.
+        """
+        return If(
+            Entity.xref_entry_point,
+            env.bind(
+                Entity.children_env,
+                origin.bind(Self.origin_node, Entity.resolve_own_names)
+            ),
+
+            Entity.parent.resolve_names_from_closest_entry_point & If(
+                Entity.xref_stop_resolution,
+                env.bind(
+                    Entity.children_env,
+                    origin.bind(Self.origin_node,
+                                Entity.resolve_own_names)
+                ),
+                True
+            )
+        )
 
     @langkit_property(return_type=LexicalEnv)
     def parent_unit_env_helper(unit=AnalysisUnit, env=LexicalEnv):
@@ -2950,9 +2984,7 @@ class VariantPart(AdaNode):
 
     @langkit_property()
     def xref_equation():
-        ignore(Var(
-            Entity.discr_name.resolve_names_internal(True, LogicTrue()))
-        )
+        ignore(Var(Entity.discr_name.resolve_names_internal))
 
         return Entity.variant.logic_all(lambda var: (
             var.choices.logic_all(lambda c: c.match(
@@ -3080,23 +3112,6 @@ class ComponentList(BaseFormalParamHolder):
                            .find(lambda d: d == pm.formal.spec)
                            .is_null)
         ))
-
-        # We run resolution for discriminants, because need ref and type
-        # information to statically evaluate their values.
-        ignore(Var(discriminants_matches.map(
-            lambda match: match.actual.assoc.expr.resolve_names_internal(
-                True, And(
-                    Self.type_bind_val(match.actual.assoc.expr.type_var,
-                                       match.formal.spec
-                                       .type_expression.designated_type),
-                    If(match.actual.name.is_null,
-                       LogicTrue(),
-                       Bind(match.actual.name.ref_var, match.formal.spec))
-                )
-            )
-            # Explicitly raise an error if resolution of discriminants failed
-            ._or(PropertyError(Bool, "Failure in discriminants' resolution"))
-        )))
 
         # Get param matches for all aggregates' params. Here, we use and pass
         # down the discriminant matches, so that abstract_formal_params_impl is
@@ -7788,8 +7803,6 @@ class BaseAggregate(Expr):
     ancestor_expr = Field(type=T.Expr)
     assocs = Field(type=T.AssocList)
 
-    xref_stop_resolution = Property(True)
-
     # An aggregate is resolved separately from the rest of an expression,
     # however, resolution of the containing expression can leverage the
     # knowledge that self is an aggregate, by accepting only type that can be
@@ -7801,7 +7814,8 @@ class BaseAggregate(Expr):
                     Predicate(BaseTypeDecl.is_array_or_rec, Self.type_var)))
     )
 
-    @langkit_property(return_type=MultidimAggregateInfo, dynamic_vars=[origin])
+    @langkit_property(return_type=MultidimAggregateInfo, dynamic_vars=[origin],
+                      memoized=True, call_memoizable=True)
     def multidim_root_aggregate(r=(Int, 0)):
         """
         Return the root parent aggregate if Self is part of a multidimensional
@@ -7826,143 +7840,87 @@ class BaseAggregate(Expr):
             ._.multidim_root_aggregate(r + 1)
         )
 
+    @langkit_property(return_type=T.BaseFormalParamDecl.entity.array,
+                      dynamic_vars=[origin],
+                      memoized=True, call_memoizable=True)
+    def all_discriminants():
+        """
+        Return the list of all discriminants that must be associated by this
+        aggregate.
+        """
+        td = Var(Self.type_val.cast(BaseTypeDecl))
+        record_decl = Var(td.record_def.comps.type_decl)
+        return record_decl.discriminants_list
+
+    @langkit_property(return_type=T.BaseFormalParamDecl.entity.array,
+                      dynamic_vars=[origin, env],
+                      memoized=True, call_memoizable=True)
+    def all_components():
+        """
+        Return the list of all components that must be associated by this
+        aggregate.
+        """
+        td = Var(Self.type_val.cast(BaseTypeDecl))
+        comp_list = Var(td.record_def.comps)
+        return comp_list.abstract_formal_params_for_assocs(Entity.assocs)
+
+    @langkit_property(return_type=T.ParamMatch.array, dynamic_vars=[origin],
+                      memoized=True)
+    def matched_discriminants():
+        """
+        Return the list of all discriminants specified by this aggregate,
+        together with the actual used for it.
+        """
+        return Self.match_formals(
+            Entity.all_discriminants, Entity.assocs, False
+        )
+
+    @langkit_property(return_type=T.ParamMatch.array,
+                      dynamic_vars=[origin, env], memoized=True)
+    def matched_components():
+        """
+        Return the list of all components specified by this aggregate,
+        together with the actual used for it.
+        """
+        return Self.match_formals(
+            Entity.all_components, Entity.assocs, False
+        )
+
+    @langkit_property(return_type=T.SingleFormal, dynamic_vars=[origin, env])
+    def first_unmatched_formal():
+        """
+        Return the first discriminant or component that is not matched
+        explicitly.
+        """
+        # Try to find an unmatched discriminant first
+        unmatched_discr = Var(
+            Self.unpack_formals(Entity.all_discriminants).find(
+                lambda f: Not(Entity.matched_discriminants.any(
+                    lambda m: m.formal == f
+                ))
+            )
+        )
+        return If(
+            Not(unmatched_discr.is_null),
+            unmatched_discr,
+
+            # If there is no unmatched discriminant, this means all of them
+            # are specified, so the shape of the record is known: we can now
+            # try to find the unmatched formal.
+            # WARNING: for the same reason stated in
+            # AggregateAssoc.record_assoc_equation, this must be done in this
+            # order.
+            Self.unpack_formals(Entity.all_components).find(
+                lambda f: Not(Entity.matched_components.any(
+                    lambda m: m.formal == f
+                ))
+            )
+        )
+
     @langkit_property()
     def xref_equation():
-        return Cond(
-            Self.in_aspect('Global'), Entity.globals_equation,
-
-            Self.in_aspect('Depends'), Entity.depends_equation,
-
-            Self.parent.is_a(AspectClause, AspectAssoc, PragmaArgumentAssoc),
-            LogicTrue(),
-
-            Entity.general_xref_equation
-        )
-
-    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
-    def globals_equation():
-        return Entity.assocs.logic_all(
-            # Assoc expr can either be a name or an aggregate. If a name, then
-            # resolve. If an aggregate, resolution will be handled recursively
-            # by solve.
-            lambda assoc: assoc.expr.sub_equation
-        )
-
-    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
-    def depends_equation():
-        return Entity.assocs.logic_all(
-            lambda assoc:
-
-            # For both the name and the expr, same as in `globals_equation`, we
-            # call sub_equation: If it's a name it will resolve the name. If
-            # it's an aggregate it will return LogicTrue() and the content will
-            # be resolved separately.
-
-            assoc.expr.sub_equation
-            # Here, we go fetch the first element of the list of names. Since
-            # we parse this as an aggregate, the list is elements separated by
-            # pipes (alternatives_list), which will ever only have one element
-            # in this case.
-            & assoc.names.at(0).as_entity.then(
-                lambda n: n.sub_equation, default_val=LogicTrue()
-            )
-        )
-
-    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
-    def general_xref_equation():
-
-        # Self might be part of a multidim array aggregate. In that case, get
-        # the root parent aggregate.
-        mra = Var(Entity.multidim_root_aggregate)
-
-        # If we're part of a multidim aggregate, then take the root aggregate's
-        # type. Else, this is a regular aggregate. In this case grab the type
-        # in type_val.
-        td = Var(If(mra.is_null, Self.type_val.cast(BaseTypeDecl), mra.typ))
-
-        atd = Var(td.array_def)
-
-        return Cond(
-            atd.is_null,
-
-            # First case, aggregate for a record
-            Entity.ancestor_expr.then(
-                lambda ae: ae.sub_equation, default_val=LogicTrue()
-            )
-            & Entity.record_equation(td),
-
-            # Second case, aggregate for an array
-            Entity.assocs.logic_all(
-                lambda assoc:
-                If(
-                    # If the array is monodimensional, or we're on the last
-                    # dimension of a multidimensional array ..
-                    Or(mra.is_null, mra.rank == td.array_ndims - 1),
-
-                    # .. Then we want to match the component type
-                    assoc.expr.sub_equation
-                    & Self.type_bind_val(assoc.expr.type_var, atd.comp_type),
-
-                    # .. Else we're on an intermediate dimension of a
-                    # multidimensional array: do nothing.
-                    LogicTrue()
-                )
-
-                & assoc.names.logic_all(
-                    lambda n:
-                    n.as_entity.sub_equation
-                    & n.cast(T.Expr).then(
-                        lambda n: Self.type_bind_val(n.type_var,
-                                                     atd.index_type(mra.rank)),
-                        default_val=LogicTrue()
-                    )
-                )
-            )
-        )
-
-    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
-    def record_equation(td=BaseTypeDecl.entity):
-        """
-        Equation for the case where this is an aggregate for a record
-        type.
-        """
-
-        all_params = Var(
-            td.record_def
-            .comps.abstract_formal_params_for_assocs(Entity.assocs)
-        )
-
-        matches = Var(Self.match_formals(all_params, Entity.assocs, False))
-
-        others_assoc = Entity.assocs.find(
-            lambda assoc: assoc.names.any(
-                lambda n: n.is_a(OthersDesignator)
-            )
-        )
-
-        # Match formals to actuals, and compute equations
-        return matches.logic_all(
-            lambda pm:
-            Self.type_bind_val(pm.actual.assoc.expr.type_var,
-                               pm.formal.spec.type_expression.designated_type)
-            & pm.actual.assoc.expr.sub_equation
-            & pm.actual.name.then(lambda n: Bind(n.ref_var, pm.formal.spec),
-                                  LogicTrue())
-        ) & others_assoc.then(
-            # Since all the formals designated by "others" should have the same
-            # type, we look for the first formal that was not yet matched and
-            # use its type as the type of the expression associated to
-            # "others".
-            lambda oa: Self.unpack_formals(all_params).find(
-                lambda f: Not(matches.any(lambda m: m.formal == f))
-            ).then(
-                lambda unmatched_formal: Self.type_bind_val(
-                    oa.expr.type_var,
-                    unmatched_formal.spec.type_expression.designated_type
-                ),
-                default_val=LogicTrue()
-            ),
-            default_val=LogicTrue()
+        return Entity.ancestor_expr.then(
+            lambda ae: ae.sub_equation, default_val=LogicTrue()
         )
 
 
@@ -9332,6 +9290,178 @@ class AggregateAssoc(BasicAssoc):
     expr = Property(Entity.r_expr)
     names = Property(Self.designators.map(lambda d: d))
 
+    xref_stop_resolution = Property(True)
+
+    base_aggregate = Property(
+        Entity.parent.parent.cast_or_raise(BaseAggregate)
+    )
+
+    @langkit_property()
+    def xref_equation():
+        agg = Var(Entity.base_aggregate)
+        return Cond(
+            agg.in_aspect('Global'), Entity.globals_assoc_equation,
+
+            agg.in_aspect('Depends'), Entity.depends_assoc_equation,
+
+            agg.parent.is_a(AspectClause, AspectAssoc, PragmaArgumentAssoc),
+            LogicTrue(),
+
+            Entity.general_xref_equation
+        )
+
+    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
+    def general_xref_equation():
+        mra = Var(Entity.base_aggregate.multidim_root_aggregate)
+
+        # If we're part of a multidim aggregate, then take the root aggregate's
+        # type. Else, this is a regular aggregate. In this case grab the type
+        # in type_val.
+        td = Var(If(
+            Not(mra.is_null),
+            mra.typ,
+            Entity.base_aggregate.type_val.cast(BaseTypeDecl),
+        ))
+
+        atd = Var(td.array_def)
+
+        return Cond(
+            atd.is_null,
+            Entity.record_assoc_equation(),
+            Entity.array_assoc_equation(atd, mra)
+        )
+
+    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
+    def record_assoc_equation():
+        """
+        Equation for the case where this is an aggregate assoc for a record
+        type.
+        """
+        agg = Var(Entity.base_aggregate)
+
+        # First, try to find all the discriminants matched by this assoc
+        discr_matches = Var(agg.matched_discriminants.filter(
+            lambda pm: pm.actual.assoc == Entity
+        ))
+
+        # If there are none, this assoc matches one or several components of
+        # the record, so gather them.
+        # WARNING: It is important to gather these components ONLY IF this
+        # association is not for specifying a discriminant. Indeed,
+        # discriminants can (and must) be resolved separately once the type of
+        # the aggregate is known. Otherwise, name resolution will enter an
+        # infinite loop when trying to match an available component for this
+        # association, as it requires statically evaluating discriminants which
+        # involves doing name resolution on them, thus introducing a cycle.
+        matches = Var(If(
+            Not(discr_matches.is_null),
+
+            discr_matches,
+
+            agg.matched_components.filter(
+                lambda pm: pm.actual.assoc == Entity
+            )
+        ))
+
+        # Store whether this is the `others => ...` association
+        is_others_assoc = Var(Entity.names.any(
+            lambda n: n.is_a(OthersDesignator)
+        ))
+
+        return If(
+            Not(is_others_assoc),
+
+            matches.logic_all(lambda match: And(
+                Self.type_bind_val(
+                    match.actual.assoc.expr.type_var,
+                    match.formal.spec.type_expression.designated_type
+                ),
+                match.actual.assoc.expr.sub_equation,
+                match.actual.name.then(
+                    lambda n: Bind(n.ref_var, match.formal.spec),
+                    LogicTrue()
+                )
+            )),
+
+            # Since all the formals designated by "others" should have the same
+            # type, we look for the first formal that was not yet matched and
+            # use its type as the type of the expression associated to
+            # "others".
+            agg.first_unmatched_formal.then(
+                lambda unmatched_formal: Self.type_bind_val(
+                    Entity.expr.type_var,
+                    unmatched_formal.spec.type_expression.designated_type
+                ),
+                default_val=LogicTrue()
+            )
+        )
+
+    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
+    def array_assoc_equation(atd=ArrayTypeDef.entity,
+                             mra=MultidimAggregateInfo):
+        """
+        Equation for the case where this is an aggregate assoc for an array
+        type.
+        """
+        return And(
+            If(
+                # If the array is monodimensional, or we're on the last
+                # dimension of a multidimensional array ..
+                Or(mra.is_null, mra.rank == atd.array_ndims - 1),
+
+                # .. Then we want to match the component type
+                Entity.expr.sub_equation
+                & Self.type_bind_val(Entity.expr.type_var, atd.comp_type),
+
+                # .. Else we're on an intermediate dimension of a
+                # multidimensional array: do nothing.
+                LogicTrue()
+            ),
+
+            Entity.names.logic_all(
+                lambda n:
+                n.as_entity.sub_equation
+                & n.cast(T.Expr).then(
+                    lambda n: Self.type_bind_val(n.type_var,
+                                                 atd.index_type(mra.rank)),
+                    default_val=LogicTrue()
+                )
+            )
+        )
+
+    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
+    def globals_assoc_equation():
+        """
+        Equation for the case where this is an aggregate assoc for a Globals
+        aspect.
+        """
+        # Assoc expr can either be a name or an aggregate. If a name, then
+        # resolve. If an aggregate, resolution will be handled recursively
+        # by solve.
+        return Entity.expr.sub_equation
+
+    @langkit_property(return_type=Equation, dynamic_vars=[env, origin])
+    def depends_assoc_equation():
+        """
+        Equation for the case where this is an aggregate assoc for a Depends
+        aspect.
+        """
+        return And(
+            # For both the name and the expr, same as in `globals_equation`, we
+            # call sub_equation: If it's a name it will resolve the name. If
+            # it's an aggregate it will return LogicTrue() and the content will
+            # be resolved separately.
+            Entity.expr.sub_equation,
+
+            # Here, we go fetch the first element of the list of names. Since
+            # we parse this as an aggregate, the list is elements separated by
+            # pipes (alternatives_list), which will ever only have one element
+            # in this case.
+            Entity.names.at(0).as_entity.then(
+                lambda n: n.sub_equation, default_val=LogicTrue()
+            )
+        )
+
 
 class MultiDimArrayAssoc(AggregateAssoc):
     """
@@ -9588,8 +9718,8 @@ class CaseExpr(Expr):
     def xref_equation():
         # We solve Self.expr separately because it is not dependent on the rest
         # of the semres.
-        ignore(Var(Entity.expr.resolve_names_internal(
-            True, Predicate(BaseTypeDecl.is_discrete_type, Self.expr.type_var)
+        ignore(Var(Entity.expr.resolve_names_internal_with_eq(
+            Predicate(BaseTypeDecl.is_discrete_type, Self.expr.type_var)
         )))
 
         return Entity.cases.logic_all(lambda alt: (
@@ -10989,8 +11119,7 @@ class ForLoopSpec(LoopSpec):
     def iterator_xref_equation():
         iter_expr = Var(Entity.iter_expr.cast_or_raise(T.Expr))
 
-        p = Var(iter_expr.resolve_names_internal(
-            True,
+        p = Var(iter_expr.resolve_names_internal_with_eq(
             Predicate(BaseTypeDecl.is_iterator_type,
                       iter_expr.type_var)
         ))
@@ -11605,9 +11734,7 @@ class AttributeRef(Name):
         # representing an int that we will use as a dimension.
         dim = Var(Entity.args_list.then(lambda a: a.at(0).expr.then(
             lambda expr: Let(
-                lambda _=expr.resolve_names_internal(
-                    True, LogicTrue()
-                ):
+                lambda _=expr.resolve_names_internal:
                 expr.eval_as_int.as_int
             ), default_val=1), default_val=1
         ) - 1)
@@ -11635,8 +11762,7 @@ class AttributeRef(Name):
             # Prefix is not a type: In that case we have permission to resolve
             # prefix separately.
             Let(lambda
-                res=Entity.prefix.resolve_names_internal(
-                    True,
+                res=Entity.prefix.resolve_names_internal_with_eq(
                     Predicate(BaseTypeDecl.is_array_def_with_deref,
                               Entity.prefix.type_var)
                 ),
@@ -12673,8 +12799,7 @@ class CaseStmt(CompositeStmt):
 
     @langkit_property()
     def xref_equation():
-        ignore(Var(Entity.expr.resolve_names_internal(
-            True,
+        ignore(Var(Entity.expr.resolve_names_internal_with_eq(
             # First make sure null is not a possible value for the type of
             # the expression so as to avoid a null check in subsequent
             # predicates.

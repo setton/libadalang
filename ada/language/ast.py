@@ -2292,6 +2292,27 @@ class Body(BasicDecl):
         ).cast_or_raise(T.BasicDecl.entity)
 
     @langkit_property(dynamic_vars=[env])
+    def entry_previous_part():
+        """
+        Return the EntryDecl corresponding to this node.
+        """
+        spec = Var(Entity.cast_or_raise(EntryBody).params)
+        return env.get(Entity.name_symbol).find(
+            lambda sp: And(
+                Not(sp.is_null),
+                Not(sp.node == Self),
+                sp.match(
+                    lambda entry_decl=T.EntryDecl:
+                    entry_decl.spec.match_formal_params(
+                        spec.abstract_formal_params
+                    ),
+
+                    lambda _: False
+                )
+            )
+        ).cast_or_raise(T.EntryDecl.entity)
+
+    @langkit_property(dynamic_vars=[env])
     def package_previous_part():
         """
         Return the BasePackageDecl corresponding to this node.
@@ -2340,13 +2361,13 @@ class Body(BasicDecl):
         pp = Var(Entity.match(
             lambda _=T.BaseSubpBody: Entity.subp_previous_part,
             lambda _=T.SubpBodyStub: Entity.subp_previous_part,
+            lambda _=T.EntryBody: Entity.entry_previous_part,
             lambda _=T.PackageBody: Entity.package_previous_part,
             lambda _=T.PackageBodyStub: Entity.package_previous_part,
             lambda _=T.ProtectedBody: Entity.protected_previous_part,
             lambda _=T.ProtectedBodyStub: Entity.protected_previous_part,
             lambda _=T.TaskBody: Entity.task_previous_part,
-            lambda _=T.TaskBodyStub: Entity.task_previous_part,
-            lambda _: No(T.BasicDecl.entity),
+            lambda _=T.TaskBodyStub: Entity.task_previous_part
         ))
 
         # HACK: All previous_part implems except the one for subprograms skip
@@ -13703,7 +13724,31 @@ class EntryBody(Body):
 
     defining_names = Property(Entity.entry_name.singleton)
 
-    env_spec = EnvSpec(add_env())
+    env_spec = EnvSpec(
+        do(Self.env_hook),
+
+        set_initial_env(
+            env.bind(Self.default_initial_env, Entity.body_scope(
+                # If this is a library-level subprogram declaration, we have
+                # visibility on the private part of our parent package, if any.
+                follow_private=Self.is_compilation_unit_root
+            )),
+        ),
+
+        # Add the body to its own parent env, if it's not the body of a stub
+        # (in which case the stub will act as the body).
+        add_to_env(
+            new_env_assoc(
+                Entity.name_symbol,
+                Self,
+                dest_env=env.bind(
+                    Self.default_initial_env, Entity.body_scope(False)
+                )
+            ).singleton,
+        ),
+
+        add_env(),
+    )
 
     xref_entry_point = Property(True)
 
